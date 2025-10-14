@@ -1,10 +1,84 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 import json
 import asyncio
-from typing import Optional
+from typing import Optional, Set
+from datetime import datetime
 
 app = FastAPI()
+
+# ========== WEBSOCKET CONNECTION MANAGER ==========
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self.last_status = None
+        
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.add(websocket)
+        print(f"✓ WebSocket connected. Total connections: {len(self.active_connections)}")
+        
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+        print(f"✗ WebSocket disconnected. Total connections: {len(self.active_connections)}")
+        
+    async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients"""
+        if not self.active_connections:
+            return
+            
+        disconnected = set()
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                print(f"Error sending to client: {e}")
+                disconnected.add(connection)
+        
+        # Remove disconnected clients
+        for connection in disconnected:
+            self.disconnect(connection)
+    
+    async def send_status_update(self, status_data: dict):
+        """Send status update to all clients"""
+        message = {
+            "type": "status_update",
+            "timestamp": int(datetime.now().timestamp()),
+            "data": status_data
+        }
+        self.last_status = status_data
+        await self.broadcast(message)
+    
+    async def send_health_update(self, health_data: dict):
+        """Send health update to all clients"""
+        message = {
+            "type": "health_update",
+            "timestamp": int(datetime.now().timestamp()),
+            "data": health_data
+        }
+        await self.broadcast(message)
+    
+    async def send_error(self, error_message: str, severity: str = "warning", node: str = None):
+        """Send error/warning to all clients"""
+        message = {
+            "type": "error",
+            "timestamp": int(datetime.now().timestamp()),
+            "severity": severity,
+            "node": node,
+            "message": error_message
+        }
+        await self.broadcast(message)
+    
+    async def send_ping(self):
+        """Send keep-alive ping"""
+        message = {
+            "type": "ping",
+            "timestamp": int(datetime.now().timestamp())
+        }
+        await self.broadcast(message)
+
+manager = ConnectionManager()
 
 # ========== CONFIG ==========
 
@@ -52,6 +126,128 @@ async def get_time_sync():
     """Get detailed NTP/Chrony time synchronization info"""
     return await get_chrony_stats()
 
+# ========== WEBSOCKET ENDPOINT ==========
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time updates.
+    
+    Sends:
+    - status_update: When recording state changes
+    - health_update: Every 3 seconds
+    - ping: Keep-alive every 30 seconds
+    - error: Warnings and errors
+    """
+    await manager.connect(websocket)
+    
+    try:
+        # Send initial status
+        if manager.last_status:
+            await websocket.send_json({
+                "type": "status_update",
+                "timestamp": int(datetime.now().timestamp()),
+                "data": manager.last_status
+            })
+        
+        # Keep connection alive and listen for messages
+        while True:
+            try:
+                # Wait for message with timeout (ping interval)
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0
+                )
+                
+                # Handle client messages (if any)
+                try:
+                    message = json.loads(data)
+                    if message.get("type") == "ping":
+                        await websocket.send_json({
+                            "type": "pong",
+                            "timestamp": int(datetime.now().timestamp())
+                        })
+                except json.JSONDecodeError:
+                    pass
+                    
+            except asyncio.TimeoutError:
+                # Send keep-alive ping
+                await manager.send_ping()
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+
+# ========== BACKGROUND TASKS ==========
+
+async def health_monitor():
+    """Background task to monitor node health and send updates via WebSocket"""
+    while True:
+        try:
+            await asyncio.sleep(3)  # Every 3 seconds
+            
+            if not manager.active_connections:
+                continue  # Skip if no clients connected
+            
+            nodes = load_nodes()
+            status_results = await node_client.status_all_nodes(nodes)
+            
+            health_data = {
+                "nodes": []
+            }
+            
+            for result in status_results:
+                node_name = result['node']
+                
+                if not result['success']:
+                    health_data['nodes'].append({
+                        "name": node_name,
+                        "connected": False,
+                        "error": result.get('error', 'Unable to connect')
+                    })
+                    continue
+                
+                data = result['data']
+                storage = data.get('storage', {})
+                free_mb = storage.get('free_mb', 0)
+                
+                node_health = {
+                    "name": node_name,
+                    "connected": True,
+                    "state": data.get('state', 'unknown'),
+                    "storage_free_mb": free_mb,
+                    "storage_percent_used": storage.get('used_percent', 0)
+                }
+                
+                # Add recording info if recording
+                if data.get('recording'):
+                    node_health['recording'] = True
+                    node_health['duration'] = data.get('duration', 0)
+                    node_health['session_id'] = data.get('session_id')
+                
+                health_data['nodes'].append(node_health)
+                
+                # Check for low storage warning
+                if free_mb > 0 and free_mb < 500:
+                    await manager.send_error(
+                        f"Low storage: {free_mb} MB remaining",
+                        severity="warning",
+                        node=node_name
+                    )
+            
+            await manager.send_health_update(health_data)
+            
+        except Exception as e:
+            print(f"Health monitor error: {e}")
+            await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks"""
+    asyncio.create_task(health_monitor())
+
 # ========== NODE MANAGEMENT ==========
 
 @app.get("/nodes")
@@ -72,18 +268,7 @@ async def register_node(node_name: str, node_url: str):
 
 @app.post("/recording/start/synchronized")
 async def start_synchronized_recording(delay: int = 5):
-    """
-    Start synchronized recording across all camera nodes.
-    
-    Flow:
-    1. Performs thorough pre-flight checks on all nodes
-    2. If any node not ready, returns detailed error
-    3. If all ready, calculates start_time and schedules all nodes
-    4. Returns start_time to phone for synchronized sensor recording
-    
-    Args:
-        delay: Seconds in future to start (default: 5, min: 2, max: 30)
-    """
+    """Start synchronized recording across all camera nodes."""
     import time
     
     # Validate delay
@@ -94,9 +279,7 @@ async def start_synchronized_recording(delay: int = 5):
     
     nodes = load_nodes()
     
-    # ========== THOROUGH PRE-FLIGHT CHECKS ==========
-    
-    # Check all nodes in parallel
+    # Pre-flight checks
     status_results = await node_client.status_all_nodes(nodes)
     
     node_status = {}
@@ -119,7 +302,6 @@ async def start_synchronized_recording(delay: int = 5):
         storage = data.get('storage', {})
         free_mb = storage.get('free_mb', 0)
         
-        # Check if node is ready
         is_ready = True
         reason = None
         
@@ -148,7 +330,6 @@ async def start_synchronized_recording(delay: int = 5):
                 "reason": reason
             })
     
-    # If any nodes not ready, return detailed error
     if not_ready:
         raise HTTPException(
             status_code=409,
@@ -160,12 +341,10 @@ async def start_synchronized_recording(delay: int = 5):
             }
         )
     
-    # ========== ALL NODES READY - SCHEDULE RECORDING ==========
-    
     # Calculate start time
     start_time = int(time.time()) + delay
     
-    # Generate session ID based on start time
+    # Generate session ID
     from datetime import datetime
     dt = datetime.fromtimestamp(start_time)
     session_id = dt.strftime("session_%Y%m%d_%H%M%S")
@@ -173,7 +352,6 @@ async def start_synchronized_recording(delay: int = 5):
     # Schedule all nodes
     schedule_results = await node_client.start_all_nodes(nodes, scheduled=start_time)
     
-    # Build response
     nodes_response = []
     all_scheduled = True
     
@@ -202,19 +380,12 @@ async def start_synchronized_recording(delay: int = 5):
 
 @app.post("/recording/stop/synchronized")
 async def stop_synchronized_recording():
-    """
-    Stop recording on all camera nodes immediately.
-    
-    Returns status of stop operation for each node.
-    """
+    """Stop recording on all nodes immediately."""
     import time
     
     nodes = load_nodes()
-    
-    # Stop all nodes in parallel
     stop_results = await node_client.stop_all_nodes(nodes)
     
-    # Build response
     stopped_at = int(time.time())
     nodes_response = []
     
@@ -228,6 +399,15 @@ async def stop_synchronized_recording():
             "data": result.get('data', {}) if success else {"error": result.get('error')}
         })
     
+    # Broadcast stop event via WebSocket
+    await manager.send_status_update({
+        "recording": False,
+        "session_id": None,
+        "duration": 0,
+        "stopped_at": stopped_at,
+        "nodes": nodes_response
+    })
+    
     return {
         "stopped_at": stopped_at,
         "nodes": nodes_response
@@ -235,21 +415,10 @@ async def stop_synchronized_recording():
 
 @app.get("/recording/status")
 async def get_recording_status():
-    """
-    Get current recording status across all nodes.
-    
-    Returns:
-    - Overall recording state
-    - Session ID if recording
-    - Duration if recording
-    - Individual node statuses
-    """
+    """Get current recording status across all nodes."""
     nodes = load_nodes()
-    
-    # Get status from all nodes
     status_results = await node_client.status_all_nodes(nodes)
     
-    # Analyze results
     is_recording = False
     session_id = None
     max_duration = 0
@@ -273,7 +442,6 @@ async def get_recording_status():
         duration = data.get('duration', 0)
         storage = data.get('storage', {})
         
-        # Track if any node is recording
         if node_recording:
             is_recording = True
             if session_id is None:
@@ -290,11 +458,73 @@ async def get_recording_status():
             "storage_percent_used": storage.get('used_percent', 0)
         })
     
-    return {
+    status_data = {
         "recording": is_recording,
         "session_id": session_id,
         "duration": max_duration,
         "nodes": nodes_response
+    }
+    
+    # Update last status for WebSocket
+    manager.last_status = status_data
+    
+    return status_data
+
+@app.get("/recording/list")
+async def list_all_recordings():
+    """Get all recordings from all nodes, grouped by session."""
+    nodes = load_nodes()
+    
+    # Get recordings from all nodes in parallel
+    tasks = []
+    for node_name, node_url in nodes.items():
+        tasks.append(node_client.node_recordings(node_url))
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Build a map: session_id -> {cam1: recording_data, cam2: recording_data}
+    sessions = {}
+    node_names = list(nodes.keys())
+    
+    for i, result in enumerate(results):
+        node_name = node_names[i]
+        
+        if isinstance(result, Exception):
+            continue
+        
+        recordings = result.get('recordings', [])
+        
+        for recording in recordings:
+            session_id = recording.get('id') or recording.get('session_id')
+            
+            if session_id not in sessions:
+                sessions[session_id] = {
+                    'session_id': session_id,
+                    'nodes': {},
+                    'node_count': 0,
+                    'complete': False
+                }
+            
+            sessions[session_id]['nodes'][node_name] = recording
+            sessions[session_id]['node_count'] += 1
+    
+    # Mark sessions as complete if all nodes have recordings
+    total_nodes = len(nodes)
+    for session_id, session_data in sessions.items():
+        session_data['complete'] = (session_data['node_count'] == total_nodes)
+        session_data['missing_nodes'] = [
+            node for node in nodes.keys() 
+            if node not in session_data['nodes']
+        ]
+    
+    # Convert to list and sort by session_id (newest first)
+    session_list = list(sessions.values())
+    session_list.sort(key=lambda x: x['session_id'], reverse=True)
+    
+    return {
+        'total_sessions': len(session_list),
+        'total_nodes': total_nodes,
+        'sessions': session_list
     }
 
 # ========== BULK OPERATIONS (MUST BE BEFORE INDIVIDUAL ROUTES) ==========
@@ -412,64 +642,3 @@ async def delete_node_recording(node_name: str, session_id: str):
         return await node_client.node_delete_recording(nodes[node_name], session_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Error: {str(e)}")
-
-@app.get("/recording/list")
-async def list_all_recordings():
-    """
-    Get all recordings from all nodes, grouped by session.
-    
-    Shows which sessions have complete recordings (all nodes) vs incomplete.
-    """
-    nodes = load_nodes()
-    
-    # Get recordings from all nodes in parallel
-    tasks = []
-    for node_name, node_url in nodes.items():
-        tasks.append(node_client.node_recordings(node_url))
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Build a map: session_id -> {cam1: recording_data, cam2: recording_data}
-    sessions = {}
-    node_names = list(nodes.keys())
-    
-    for i, result in enumerate(results):
-        node_name = node_names[i]
-        
-        if isinstance(result, Exception):
-            continue
-        
-        recordings = result.get('recordings', [])
-        
-        for recording in recordings:
-            session_id = recording.get('id') or recording.get('session_id')
-            
-            if session_id not in sessions:
-                sessions[session_id] = {
-                    'session_id': session_id,
-                    'nodes': {},
-                    'node_count': 0,
-                    'complete': False
-                }
-            
-            sessions[session_id]['nodes'][node_name] = recording
-            sessions[session_id]['node_count'] += 1
-    
-    # Mark sessions as complete if all nodes have recordings
-    total_nodes = len(nodes)
-    for session_id, session_data in sessions.items():
-        session_data['complete'] = (session_data['node_count'] == total_nodes)
-        session_data['missing_nodes'] = [
-            node for node in nodes.keys() 
-            if node not in session_data['nodes']
-        ]
-    
-    # Convert to list and sort by session_id (newest first)
-    session_list = list(sessions.values())
-    session_list.sort(key=lambda x: x['session_id'], reverse=True)
-    
-    return {
-        'total_sessions': len(session_list),
-        'total_nodes': total_nodes,
-        'sessions': session_list
-    }

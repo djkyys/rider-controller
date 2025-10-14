@@ -3,3 +3,4 @@ uvicorn
 psutil
 aiohttp
 python-multipart
+websockets
