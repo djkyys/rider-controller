@@ -1,0 +1,191 @@
+{
+  "discovered_at": "2025-10-16T13:45:41.405388",
+  "count": 37,
+  "commands": [
+    {
+      "name": "PIDS_A",
+      "description": "Supported PIDs [01-20]",
+      "pid": 0
+    },
+    {
+      "name": "STATUS",
+      "description": "Status since DTCs cleared",
+      "pid": 1
+    },
+    {
+      "name": "FUEL_STATUS",
+      "description": "Fuel System Status",
+      "pid": 3
+    },
+    {
+      "name": "ENGINE_LOAD",
+      "description": "Calculated Engine Load",
+      "pid": 4
+    },
+    {
+      "name": "COOLANT_TEMP",
+      "description": "Engine Coolant Temperature",
+      "pid": 5
+    },
+    {
+      "name": "SHORT_FUEL_TRIM_1",
+      "description": "Short Term Fuel Trim - Bank 1",
+      "pid": 6
+    },
+    {
+      "name": "LONG_FUEL_TRIM_1",
+      "description": "Long Term Fuel Trim - Bank 1",
+      "pid": 7
+    },
+    {
+      "name": "RPM",
+      "description": "Engine RPM",
+      "pid": 12
+    },
+    {
+      "name": "SPEED",
+      "description": "Vehicle Speed",
+      "pid": 13
+    },
+    {
+      "name": "TIMING_ADVANCE",
+      "description": "Timing Advance",
+      "pid": 14
+    },
+    {
+      "name": "INTAKE_TEMP",
+      "description": "Intake Air Temp",
+      "pid": 15
+    },
+    {
+      "name": "MAF",
+      "description": "Air Flow Rate (MAF)",
+      "pid": 16
+    },
+    {
+      "name": "THROTTLE_POS",
+      "description": "Throttle Position",
+      "pid": 17
+    },
+    {
+      "name": "O2_SENSORS",
+      "description": "O2 Sensors Present",
+      "pid": 19
+    },
+    {
+      "name": "O2_B1S1",
+      "description": "O2: Bank 1 - Sensor 1 Voltage",
+      "pid": 20
+    },
+    {
+      "name": "O2_B1S2",
+      "description": "O2: Bank 1 - Sensor 2 Voltage",
+      "pid": 21
+    },
+    {
+      "name": "OBD_COMPLIANCE",
+      "description": "OBD Standards Compliance",
+      "pid": 28
+    },
+    {
+      "name": "RUN_TIME",
+      "description": "Engine Run Time",
+      "pid": 31
+    },
+    {
+      "name": "PIDS_B",
+      "description": "Supported PIDs [21-40]",
+      "pid": 32
+    },
+    {
+      "name": "DISTANCE_W_MIL",
+      "description": "Distance Traveled with MIL on",
+      "pid": 33
+    },
+    {
+      "name": "EVAPORATIVE_PURGE",
+      "description": "Commanded Evaporative Purge",
+      "pid": 46
+    },
+    {
+      "name": "WARMUPS_SINCE_DTC_CLEAR",
+      "description": "Number of warm-ups since codes cleared",
+      "pid": 48
+    },
+    {
+      "name": "DISTANCE_SINCE_DTC_CLEAR",
+      "description": "Distance traveled since codes cleared",
+      "pid": 49
+    },
+    {
+      "name": "BAROMETRIC_PRESSURE",
+      "description": "Barometric Pressure",
+      "pid": 51
+    },
+    {
+      "name": "CATALYST_TEMP_B1S1",
+      "description": "Catalyst Temperature: Bank 1 - Sensor 1",
+      "pid": 60
+    },
+    {
+      "name": "CATALYST_TEMP_B1S2",
+      "description": "Catalyst Temperature: Bank 1 - Sensor 2",
+      "pid": 62
+    },
+    {
+      "name": "PIDS_C",
+      "description": "Supported PIDs [41-60]",
+      "pid": 64
+    },
+    {
+      "name": "CONTROL_MODULE_VOLTAGE",
+      "description": "Control module voltage",
+      "pid": 66
+    },
+    {
+      "name": "ABSOLUTE_LOAD",
+      "description": "Absolute load value",
+      "pid": 67
+    },
+    {
+      "name": "COMMANDED_EQUIV_RATIO",
+      "description": "Commanded equivalence ratio",
+      "pid": 68
+    },
+    {
+      "name": "RELATIVE_THROTTLE_POS",
+      "description": "Relative throttle position",
+      "pid": 69
+    },
+    {
+      "name": "THROTTLE_POS_B",
+      "description": "Absolute throttle position B",
+      "pid": 71
+    },
+    {
+      "name": "ACCELERATOR_POS_D",
+      "description": "Accelerator pedal position D",
+      "pid": 73
+    },
+    {
+      "name": "ACCELERATOR_POS_E",
+      "description": "Accelerator pedal position E",
+      "pid": 74
+    },
+    {
+      "name": "THROTTLE_ACTUATOR",
+      "description": "Commanded throttle actuator",
+      "pid": 76
+    },
+    {
+      "name": "RUN_TIME_MIL",
+      "description": "Time run with MIL on",
+      "pid": 77
+    },
+    {
+      "name": "TIME_SINCE_DTC_CLEARED",
+      "description": "Time since trouble codes cleared",
+      "pid": 78
+    }
+  ]
+}

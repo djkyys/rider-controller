@@ -5,6 +5,10 @@ import asyncio
 from typing import Optional, Set
 from datetime import datetime
 
+# Setup unified logging
+from config.logging_config import setup_logger
+logger = setup_logger('main')
+
 app = FastAPI()
 
 # ========== WEBSOCKET CONNECTION MANAGER ==========
@@ -17,11 +21,11 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.add(websocket)
-        print(f"✓ WebSocket connected. Total connections: {len(self.active_connections)}")
+        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
         
     def disconnect(self, websocket: WebSocket):
         self.active_connections.discard(websocket)
-        print(f"✗ WebSocket disconnected. Total connections: {len(self.active_connections)}")
+        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
         
     async def broadcast(self, message: dict):
         """Broadcast message to all connected clients"""
@@ -33,7 +37,7 @@ class ConnectionManager:
             try:
                 await connection.send_json(message)
             except Exception as e:
-                print(f"Error sending to client: {e}")
+                logger.error(f"Error sending to client: {e}")
                 disconnected.add(connection)
         
         # Remove disconnected clients
@@ -69,6 +73,12 @@ class ConnectionManager:
             "message": error_message
         }
         await self.broadcast(message)
+        
+        # Also log it
+        if severity == "error":
+            logger.error(f"Node {node}: {error_message}")
+        else:
+            logger.warning(f"Node {node}: {error_message}")
     
     async def send_ping(self):
         """Send keep-alive ping"""
@@ -99,6 +109,10 @@ from monitors.health import get_health_status
 from monitors.chrony import get_chrony_stats
 import node_client
 
+# ========== OBD INTEGRATION ==========
+
+from obd_client import obd_client
+
 # ========== THIS SERVER ENDPOINTS ==========
 
 @app.get("/system")
@@ -126,6 +140,33 @@ async def get_time_sync():
     """Get detailed NTP/Chrony time synchronization info"""
     return await get_chrony_stats()
 
+# ========== OBD ENDPOINTS (PROXIED) ==========
+
+@app.get("/obd/status")
+async def get_obd_status():
+    """Check if OBD service is available"""
+    available = await obd_client.check_available()
+    return {
+        "available": available,
+        "service": "OBD-II Logger"
+    }
+
+@app.get("/obd/current")
+async def get_obd_current():
+    """Get current OBD data"""
+    data = await obd_client.get_current()
+    if data is None:
+        raise HTTPException(status_code=503, detail="OBD service unavailable")
+    return data
+
+@app.get("/obd/commands")
+async def get_obd_commands():
+    """Get available OBD commands"""
+    data = await obd_client.get_commands()
+    if data is None:
+        raise HTTPException(status_code=503, detail="OBD service unavailable")
+    return data
+
 # ========== WEBSOCKET ENDPOINT ==========
 
 @app.websocket("/ws")
@@ -136,6 +177,7 @@ async def websocket_endpoint(websocket: WebSocket):
     Sends:
     - status_update: When recording state changes
     - health_update: Every 3 seconds
+    - obd_update: Real-time vehicle data (if available)
     - ping: Keep-alive every 30 seconds
     - error: Warnings and errors
     """
@@ -177,7 +219,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
 # ========== BACKGROUND TASKS ==========
@@ -240,13 +282,61 @@ async def health_monitor():
             await manager.send_health_update(health_data)
             
         except Exception as e:
-            print(f"Health monitor error: {e}")
+            logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(3)
+
+async def obd_websocket_monitor():
+    """Background task to poll OBD and broadcast via WebSocket"""
+    await asyncio.sleep(5)  # Wait for startup
+    
+    # Check if OBD service is available
+    if not await obd_client.check_available():
+        logger.warning("OBD service not available - OBD monitoring disabled")
+        return
+    
+    logger.info("OBD WebSocket monitoring started")
+    
+    while True:
+        try:
+            await asyncio.sleep(1)  # Poll every 1 second
+            
+            if not manager.active_connections:
+                continue  # Skip if no clients
+            
+            # Get current OBD data
+            obd_data = await obd_client.get_current()
+            
+            if obd_data:
+                # Broadcast to WebSocket clients
+                await manager.broadcast({
+                    "type": "obd_update",
+                    "timestamp": int(datetime.now().timestamp()),
+                    "data": obd_data
+                })
+                
+        except Exception as e:
+            logger.error(f"OBD WebSocket monitor error: {e}")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks"""
+    logger.info("=" * 60)
+    logger.info("Rider Controller Starting")
+    logger.info("=" * 60)
+    
+    # Start health monitoring
     asyncio.create_task(health_monitor())
+    logger.info("✓ Health monitor started")
+    
+    # Check OBD availability and start monitoring if available
+    obd_available = await obd_client.check_available()
+    if obd_available:
+        logger.info("✓ OBD service connected")
+        asyncio.create_task(obd_websocket_monitor())
+        logger.info("✓ OBD WebSocket monitor started")
+    else:
+        logger.warning("✗ OBD service not available (non-critical)")
 
 # ========== NODE MANAGEMENT ==========
 
@@ -262,6 +352,7 @@ async def register_node(node_name: str, node_url: str):
     nodes = load_nodes()
     nodes[node_name] = node_url
     save_nodes(nodes)
+    logger.info(f"Node registered: {node_name} -> {node_url}")
     return {"message": f"Node {node_name} registered", "url": node_url}
 
 # ========== SYNCHRONIZED RECORDING API ==========
@@ -270,6 +361,8 @@ async def register_node(node_name: str, node_url: str):
 async def start_synchronized_recording(delay: int = 5):
     """Start synchronized recording across all camera nodes."""
     import time
+    
+    logger.info(f"Synchronized recording start requested (delay={delay}s)")
     
     # Validate delay
     if delay < 2:
@@ -294,6 +387,7 @@ async def start_synchronized_recording(delay: int = 5):
                 "reason": result.get('error', 'Unable to connect')
             })
             node_status[node_name] = {"ready": False, "reason": "Connection failed"}
+            logger.warning(f"Node {node_name} not ready: Connection failed")
             continue
         
         data = result['data']
@@ -329,8 +423,10 @@ async def start_synchronized_recording(delay: int = 5):
                 "ready": False,
                 "reason": reason
             })
+            logger.warning(f"Node {node_name} not ready: {reason}")
     
     if not_ready:
+        logger.error("Cannot start recording - some nodes not ready")
         raise HTTPException(
             status_code=409,
             detail={
@@ -348,6 +444,8 @@ async def start_synchronized_recording(delay: int = 5):
     from datetime import datetime
     dt = datetime.fromtimestamp(start_time)
     session_id = dt.strftime("session_%Y%m%d_%H%M%S")
+    
+    logger.info(f"Scheduling recording - Session: {session_id}, Start: {start_time}")
     
     # Schedule all nodes
     schedule_results = await node_client.start_all_nodes(nodes, scheduled=start_time)
@@ -368,6 +466,9 @@ async def start_synchronized_recording(delay: int = 5):
         
         if not success:
             all_scheduled = False
+            logger.error(f"Failed to schedule {node_name}")
+        else:
+            logger.info(f"✓ Scheduled {node_name}")
     
     return {
         "start_time": start_time,
@@ -382,6 +483,8 @@ async def start_synchronized_recording(delay: int = 5):
 async def stop_synchronized_recording():
     """Stop recording on all nodes immediately."""
     import time
+    
+    logger.info("Synchronized recording stop requested")
     
     nodes = load_nodes()
     stop_results = await node_client.stop_all_nodes(nodes)
@@ -398,6 +501,11 @@ async def stop_synchronized_recording():
             "stopped": success,
             "data": result.get('data', {}) if success else {"error": result.get('error')}
         })
+        
+        if success:
+            logger.info(f"✓ Stopped {node_name}")
+        else:
+            logger.error(f"Failed to stop {node_name}")
     
     # Broadcast stop event via WebSocket
     await manager.send_status_update({
@@ -527,7 +635,7 @@ async def list_all_recordings():
         'sessions': session_list
     }
 
-# ========== BULK OPERATIONS (MUST BE BEFORE INDIVIDUAL ROUTES) ==========
+# ========== BULK OPERATIONS ==========
 
 @app.post("/nodes/all/start")
 async def start_all_recordings(scheduled: Optional[int] = None):

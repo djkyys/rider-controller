@@ -4,3 +4,4 @@ psutil
 aiohttp
 python-multipart
 websockets
+httpx
