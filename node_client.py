@@ -59,12 +59,20 @@ async def node_recordings(node_url: str) -> Dict:
         async with session.get(f"{node_url}/recordings") as response:
             return await response.json()
 
-async def node_start_recording(node_url: str, scheduled: Optional[int] = None) -> Dict:
-    """Start recording on a node"""
+async def node_start_recording(node_url: str, scheduled: Optional[int] = None, session_id: Optional[str] = None) -> Dict:
+    """Start recording on a node with session_id"""
     timeout = aiohttp.ClientTimeout(total=5)
     url = f"{node_url}/start"
+    
+    # Build URL with parameters
+    params = []
     if scheduled:
-        url += f"?scheduled={scheduled}"
+        params.append(f"scheduled={scheduled}")
+    if session_id:
+        params.append(f"session_id={session_id}")
+    
+    if params:
+        url += "?" + "&".join(params)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url) as response:
@@ -96,17 +104,18 @@ async def node_delete_recording(node_url: str, session_id: str) -> Dict:
 
 # ========== BULK OPERATIONS ==========
 
-async def start_all_nodes(nodes: Dict[str, str], scheduled: Optional[int] = None) -> list:
-    """Start recording on all nodes simultaneously"""
+async def start_all_nodes(nodes: Dict[str, str], scheduled: Optional[int] = None, session_id: Optional[str] = None) -> list:
+    """Start recording on all nodes simultaneously with session_id"""
     async def start_node(node_name: str, node_url: str):
         try:
-            data = await node_start_recording(node_url, scheduled)
+            data = await node_start_recording(node_url, scheduled, session_id)
             return {"node": node_name, "success": True, "data": data}
         except Exception as e:
             return {"node": node_name, "success": False, "error": str(e)}
     
     tasks = [start_node(name, url) for name, url in nodes.items()]
     return await asyncio.gather(*tasks)
+
 
 async def stop_all_nodes(nodes: Dict[str, str]) -> list:
     """Stop recording on all nodes simultaneously"""

@@ -63,6 +63,15 @@ class ConnectionManager:
         }
         await self.broadcast(message)
     
+    async def send_obd_update(self, obd_data: dict):
+        """Send OBD update to all clients"""
+        message = {
+            "type": "obd_update",
+            "timestamp": int(datetime.now().timestamp()),
+            "data": obd_data
+        }
+        await self.broadcast(message)
+    
     async def send_error(self, error_message: str, severity: str = "warning", node: str = None):
         """Send error/warning to all clients"""
         message = {
@@ -159,6 +168,14 @@ async def get_obd_current():
         raise HTTPException(status_code=503, detail="OBD service unavailable")
     return data
 
+@app.get("/obd/health")
+async def get_obd_health():
+    """Get OBD service health"""
+    data = await obd_client.get_health()
+    if data is None:
+        raise HTTPException(status_code=503, detail="OBD service unavailable")
+    return data
+
 @app.get("/obd/commands")
 async def get_obd_commands():
     """Get available OBD commands"""
@@ -176,8 +193,8 @@ async def websocket_endpoint(websocket: WebSocket):
     
     Sends:
     - status_update: When recording state changes
-    - health_update: Every 3 seconds
-    - obd_update: Real-time vehicle data (if available)
+    - health_update: Every 3 seconds (camera nodes)
+    - obd_update: Every 2 seconds (vehicle data)
     - ping: Keep-alive every 30 seconds
     - error: Warnings and errors
     """
@@ -298,7 +315,7 @@ async def obd_websocket_monitor():
     
     while True:
         try:
-            await asyncio.sleep(1)  # Poll every 1 second
+            await asyncio.sleep(2)  # Poll every 2 seconds
             
             if not manager.active_connections:
                 continue  # Skip if no clients
@@ -307,12 +324,17 @@ async def obd_websocket_monitor():
             obd_data = await obd_client.get_current()
             
             if obd_data:
+                # Extract key metrics for WebSocket (don't send everything)
+                simplified_data = {
+                    "timestamp": obd_data.get("timestamp"),
+                    "speed": obd_data.get("SPEED", {}).get("value") if "SPEED" in obd_data else None,
+                    "rpm": obd_data.get("RPM", {}).get("value") if "RPM" in obd_data else None,
+                    "coolant_temp": obd_data.get("COOLANT_TEMP", {}).get("value") if "COOLANT_TEMP" in obd_data else None,
+                    "throttle": obd_data.get("THROTTLE_POS", {}).get("value") if "THROTTLE_POS" in obd_data else None,
+                }
+                
                 # Broadcast to WebSocket clients
-                await manager.broadcast({
-                    "type": "obd_update",
-                    "timestamp": int(datetime.now().timestamp()),
-                    "data": obd_data
-                })
+                await manager.send_obd_update(simplified_data)
                 
         except Exception as e:
             logger.error(f"OBD WebSocket monitor error: {e}")
@@ -338,6 +360,161 @@ async def startup_event():
     else:
         logger.warning("✗ OBD service not available (non-critical)")
 
+# ========== STORAGE MANAGEMENT ==========
+
+@app.get("/storage/status")
+async def get_storage_status():
+    """Get storage status across all devices"""
+    
+    nodes = load_nodes()
+    status_results = await node_client.status_all_nodes(nodes)
+    
+    storage_status = {
+        "overall_status": "ok",  # ok, warning, critical
+        "can_record": True,
+        "devices": []
+    }
+    
+    # Check camera nodes
+    for result in status_results:
+        node_name = result['node']
+        if result['success']:
+            free_mb = result['data'].get('storage', {}).get('free_mb', 0)
+            total_mb = result['data'].get('storage', {}).get('total_mb', 0)
+            used_percent = result['data'].get('storage', {}).get('used_percent', 0)
+            
+            status = "ok"
+            can_record = True
+            
+            min_required = MIN_FREE_MB.get(node_name, MIN_FREE_MB['cam1'])
+            warning_threshold = WARNING_FREE_MB.get(node_name, WARNING_FREE_MB['cam1'])
+            
+            if free_mb < min_required:
+                status = "critical"
+                can_record = False
+                storage_status["can_record"] = False
+                storage_status["overall_status"] = "critical"
+            elif free_mb < warning_threshold:
+                status = "warning"
+                if storage_status["overall_status"] == "ok":
+                    storage_status["overall_status"] = "warning"
+            
+            storage_status["devices"].append({
+                "name": node_name,
+                "type": "camera",
+                "free_mb": round(free_mb, 0),
+                "total_mb": round(total_mb, 0),
+                "used_percent": round(used_percent, 1),
+                "status": status,
+                "can_record": can_record,
+                "min_required_mb": min_required,
+                "estimated_recording_time_minutes": max(0, (free_mb - min_required) / 2)  # ~2MB/min
+            })
+    
+    # Check main Pi
+    disk = shutil.disk_usage('/')
+    free_mb = disk.free / (1024**2)
+    total_mb = disk.total / (1024**2)
+    used_percent = (disk.used / disk.total) * 100
+    
+    status = "ok"
+    can_record = True
+    
+    if free_mb < MIN_FREE_MB['main_pi']:
+        status = "critical"
+        can_record = False
+        storage_status["can_record"] = False
+        storage_status["overall_status"] = "critical"
+    elif free_mb < WARNING_FREE_MB['main_pi']:
+        status = "warning"
+        if storage_status["overall_status"] == "ok":
+            storage_status["overall_status"] = "warning"
+    
+    storage_status["devices"].append({
+        "name": "main_pi",
+        "type": "main_controller",
+        "free_mb": round(free_mb, 0),
+        "total_mb": round(total_mb, 0),
+        "used_percent": round(used_percent, 1),
+        "status": status,
+        "can_record": can_record,
+        "min_required_mb": MIN_FREE_MB['main_pi'],
+        "estimated_recording_time_minutes": max(0, (free_mb - MIN_FREE_MB['main_pi']) / 0.1)  # ~0.1MB/min OBD
+    })
+    
+    return storage_status
+
+# ========== SESSION MANAGEMENT ==========
+
+@app.get("/sessions/list")
+async def list_sessions(limit: int = 100, offset: int = 0):
+    """List all recording sessions"""
+    session_dir = Path("/home/pi/rider-data/sessions")
+    
+    if not session_dir.exists():
+        return {"sessions": [], "total": 0}
+    
+    sessions = []
+    for session_path in sorted(session_dir.iterdir(), reverse=True):
+        if session_path.is_dir():
+            metadata_file = session_path / "metadata.json"
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file) as f:
+                        metadata = json.load(f)
+                        sessions.append(metadata)
+                except Exception as e:
+                    logger.error(f"Error reading metadata for {session_path.name}: {e}")
+    
+    total = len(sessions)
+    sessions = sessions[offset:offset+limit]
+    
+    return {
+        "sessions": sessions,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get details of a specific session"""
+    session_path = Path(f"/home/pi/rider-data/sessions/{session_id}")
+    metadata_file = session_path / "metadata.json"
+    
+    if not metadata_file.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    with open(metadata_file) as f:
+        return json.load(f)
+
+@app.get("/sessions/stats")
+async def get_session_stats():
+    """Get overall session statistics"""
+    session_dir = Path("/home/pi/rider-data/sessions")
+    
+    if not session_dir.exists():
+        return {"total_sessions": 0, "total_size_gb": 0}
+    
+    sessions = list(session_dir.iterdir())
+    total_sessions = len(sessions)
+    
+    if total_sessions == 0:
+        return {"total_sessions": 0, "total_size_gb": 0, "average_size_mb": 0}
+    
+    total_size = 0
+    for session in sessions:
+        if session.is_dir():
+            for f in session.rglob('*'):
+                if f.is_file():
+                    total_size += f.stat().st_size
+    
+    return {
+        "total_sessions": total_sessions,
+        "total_size_gb": round(total_size / (1024**3), 2),
+        "average_size_mb": round((total_size / total_sessions) / (1024**2), 2) if total_sessions > 0 else 0
+    }
+
 # ========== NODE MANAGEMENT ==========
 
 @app.get("/nodes")
@@ -358,11 +535,25 @@ async def register_node(node_name: str, node_url: str):
 # ========== SYNCHRONIZED RECORDING API ==========
 
 @app.post("/recording/start/synchronized")
-async def start_synchronized_recording(delay: int = 5):
+async def start_synchronized_recording(delay: int = 5, session_id: Optional[str] = None):
     """Start synchronized recording across all camera nodes."""
     import time
+    import uuid
     
     logger.info(f"Synchronized recording start requested (delay={delay}s)")
+    
+    # Generate session ID if not provided (format: 20241215_143052_A1B2C3D4)
+    if not session_id:
+        session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8].upper()}"
+        logger.info(f"Generated session ID: {session_id}")
+    else:
+        logger.info(f"Using provided session ID: {session_id}")
+    
+    # Get OBD data at recording start
+    obd_data = await obd_client.get_current()
+    if obd_data:
+        speed = obd_data.get("SPEED", {}).get("value", 0)
+        logger.info(f"Recording starting at {speed} km/h")
     
     # Validate delay
     if delay < 2:
@@ -405,9 +596,9 @@ async def start_synchronized_recording(delay: int = 5):
         elif converting:
             is_ready = False
             reason = "Converting video"
-        elif free_mb < 500:
+        elif free_mb < 1000:  # Require 1GB free
             is_ready = False
-            reason = f"Low storage ({free_mb} MB free, need 500 MB)"
+            reason = f"Low storage ({free_mb} MB free, need 1000 MB)"
         
         node_status[node_name] = {
             "ready": is_ready,
@@ -440,11 +631,6 @@ async def start_synchronized_recording(delay: int = 5):
     # Calculate start time
     start_time = int(time.time()) + delay
     
-    # Generate session ID
-    from datetime import datetime
-    dt = datetime.fromtimestamp(start_time)
-    session_id = dt.strftime("session_%Y%m%d_%H%M%S")
-    
     logger.info(f"Scheduling recording - Session: {session_id}, Start: {start_time}")
     
     # Schedule all nodes
@@ -471,12 +657,13 @@ async def start_synchronized_recording(delay: int = 5):
             logger.info(f"✓ Scheduled {node_name}")
     
     return {
+        "session_id": session_id,
         "start_time": start_time,
         "countdown": delay,
-        "session_id": session_id,
         "ready": True,
         "all_scheduled": all_scheduled,
-        "nodes": nodes_response
+        "nodes": nodes_response,
+        "obd_snapshot": obd_data
     }
 
 @app.post("/recording/stop/synchronized")
@@ -485,6 +672,12 @@ async def stop_synchronized_recording():
     import time
     
     logger.info("Synchronized recording stop requested")
+    
+    # Get OBD data at recording stop
+    obd_data = await obd_client.get_current()
+    if obd_data:
+        speed = obd_data.get("SPEED", {}).get("value", 0)
+        logger.info(f"Recording stopped at {speed} km/h")
     
     nodes = load_nodes()
     stop_results = await node_client.stop_all_nodes(nodes)
@@ -518,7 +711,8 @@ async def stop_synchronized_recording():
     
     return {
         "stopped_at": stopped_at,
-        "nodes": nodes_response
+        "nodes": nodes_response,
+        "obd_snapshot": obd_data  # Include OBD data at recording stop
     }
 
 @app.get("/recording/status")
