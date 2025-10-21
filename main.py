@@ -146,7 +146,8 @@ async def get_system_stats():
 
 @app.get("/time")
 async def get_time_sync():
-    return str(datetime.now())
+    """Get detailed NTP/Chrony time synchronization info"""
+    return await get_chrony_stats()
 
 # ========== OBD ENDPOINTS (PROXIED) ==========
 
@@ -534,7 +535,7 @@ async def register_node(node_name: str, node_url: str):
 # ========== SYNCHRONIZED RECORDING API ==========
 
 @app.post("/recording/start/synchronized")
-async def start_synchronized_recording(delay: int = 5, session_id: Optional[str] = None):
+async def start_synchronized_recording(session_id: str, universal_start_time: int):
     """Start synchronized recording across all camera nodes."""
     import time
     import uuid
@@ -627,14 +628,30 @@ async def start_synchronized_recording(delay: int = 5, session_id: Optional[str]
             }
         )
     
-    # Calculate start time
-    start_time = int(time.time()) + delay
-    
+    start_time = universal_start_time
+    current_time = int(time.time())
+    calculated_delay = start_time - current_time
+
+    logger.info(f"Using client-provided start time: {start_time} (delay: {calculated_delay}s from now)")
+
+    # Validate the provided start time is in the future
+    if calculated_delay < 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"universal_start_time is in the past (was {abs(calculated_delay)}s ago)"
+        )
+    if calculated_delay > 30:
+        raise HTTPException(
+            status_code=400,
+            detail=f"universal_start_time is too far in future ({calculated_delay}s, max 30s)"
+        )
+
+    # ... then later ...
+
     logger.info(f"Scheduling recording - Session: {session_id}, Start: {start_time}")
-    
+
     # Schedule all nodes
-    schedule_results = await node_client.start_all_nodes(nodes, scheduled=start_time, session_id=session_id)
-    obd_start = await obd_client.start_session(session_id)
+    schedule_results = await node_client.start_all_nodes(nodes, scheduled=start_time)
     
     nodes_response = []
     all_scheduled = True
@@ -663,7 +680,7 @@ async def start_synchronized_recording(delay: int = 5, session_id: Optional[str]
         "ready": True,
         "all_scheduled": all_scheduled,
         "nodes": nodes_response,
-        "obd_snapshot": {"started": obd_start is not None}
+        "obd_snapshot": obd_data
     }
 
 @app.post("/recording/stop/synchronized")
@@ -673,9 +690,14 @@ async def stop_synchronized_recording():
     
     logger.info("Synchronized recording stop requested")
     
+    # Get OBD data at recording stop
+    obd_data = await obd_client.get_current()
+    if obd_data:
+        speed = obd_data.get("SPEED", {}).get("value", 0)
+        logger.info(f"Recording stopped at {speed} km/h")
+    
     nodes = load_nodes()
     stop_results = await node_client.stop_all_nodes(nodes)
-    obd_stop = await obd_client.stop_session()
     
     stopped_at = int(time.time())
     nodes_response = []
@@ -707,7 +729,7 @@ async def stop_synchronized_recording():
     return {
         "stopped_at": stopped_at,
         "nodes": nodes_response,
-        "obd_snapshot": {"stopped success": obd_stop is not None} # Include OBD data at recording stop
+        "obd_snapshot": obd_data  # Include OBD data at recording stop
     }
 
 @app.get("/recording/status")
