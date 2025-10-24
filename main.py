@@ -4,6 +4,7 @@ import json
 import asyncio
 from typing import Optional, Set
 from datetime import datetime
+from shutdown import wait_and_poweroff
 
 # Setup unified logging
 from config.logging_config import setup_logger
@@ -540,7 +541,7 @@ async def start_synchronized_recording(session_id: str, universal_start_time: in
     import time
     import uuid
     
-    logger.info(f"Synchronized recording start requested (delay={delay}s)")
+    logger.info(f"Synchronized recording start requested, timestamp = {universal_start_time}")
     
     # Generate session ID if not provided (format: 20241215_143052_A1B2C3D4)
     if not session_id:
@@ -555,11 +556,6 @@ async def start_synchronized_recording(session_id: str, universal_start_time: in
         speed = obd_data.get("SPEED", {}).get("value", 0)
         logger.info(f"Recording starting at {speed} km/h")
     
-    # Validate delay
-    if delay < 2:
-        raise HTTPException(status_code=400, detail="Minimum delay is 2 seconds")
-    if delay > 30:
-        raise HTTPException(status_code=400, detail="Maximum delay is 30 seconds")
     
     nodes = load_nodes()
     
@@ -676,7 +672,7 @@ async def start_synchronized_recording(session_id: str, universal_start_time: in
     return {
         "session_id": session_id,
         "start_time": start_time,
-        "countdown": delay,
+        "countdown": calculated_delay,
         "ready": True,
         "all_scheduled": all_scheduled,
         "nodes": nodes_response,
@@ -961,3 +957,15 @@ async def delete_node_recording(node_name: str, session_id: str):
         return await node_client.node_delete_recording(nodes[node_name], session_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Error: {str(e)}")
+
+@app.post("/shutdown-when-idle")
+async def shutdown_when_idle(max_wait_seconds: int = 300):
+    """
+    Poll camera nodes until all are idle, then poweroff this Pi.
+    
+    Args:
+        max_wait_seconds: Max time to wait (default 300 = 5 minutes)
+    """
+    nodes = load_nodes()
+    result = await wait_and_poweroff(nodes, max_wait_seconds)
+    return result
